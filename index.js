@@ -1487,7 +1487,6 @@ class SingBoxEngine {
         { type: 'block', tag: 'block' }
       ],
       route: {
-        auto_detect_interface: true,
         final: 'direct'
       }
     };
@@ -1601,11 +1600,37 @@ class SingBoxEngine {
     fs.writeFileSync(this.paths.singboxConfig, JSON.stringify(configData, null, 2), 'utf8');
     Logger.success('sing-box configuration validated.');
 
+    this._spawn();
+    this._probeInbounds(configData);
+    return true;
+  }
+
+  _spawn() {
+    try {
+      if (fs.existsSync(this.paths.singboxLog) && fs.statSync(this.paths.singboxLog).size > 5 * 1024 * 1024) {
+        fs.truncateSync(this.paths.singboxLog, 0);
+      }
+    } catch (_) {}
     const logFd = fs.openSync(this.paths.singboxLog, 'a');
     this.process = spawn(this.paths.singboxBin, ['run', '-c', this.paths.singboxConfig], {
-      stdio: ['ignore', logFd, logFd],
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached: false
     });
+    Logger.info(`sing-box started (pid ${this.process.pid})`);
+    // Mirror sing-box output to its log file and surface warnings/errors (rate-limited) in the container log.
+    let windowStart = Date.now();
+    let printed = 0;
+    const onData = (buf) => {
+      try { fs.writeSync(logFd, buf); } catch (_) {}
+      const text = buf.toString('utf8').replace(/\x1b\[[0-9;]*m/g, '');
+      for (const line of text.split('\n')) {
+        if (!/FATAL|ERROR|WARN|panic/i.test(line)) continue;
+        if (Date.now() - windowStart > 60000) { windowStart = Date.now(); printed = 0; }
+        if (++printed <= 15) console.log('[sing-box] ' + line.trim().slice(0, 300));
+      }
+    };
+    this.process.stdout.on('data', onData);
+    this.process.stderr.on('data', onData);
 
     this.process.on('error', (err) => {
       Logger.error(`sing-box process error: ${err.message}`);
@@ -1613,15 +1638,34 @@ class SingBoxEngine {
 
     this.process.on('exit', (code, sig) => {
       try { fs.closeSync(logFd); } catch {}
-      if (code !== 0 && code !== null) {
-        Logger.warn(`sing-box exited with code ${code} (${sig || 'none'})`);
+      if (this._stopping) return;
+      Logger.warn(`sing-box exited with code ${code} (${sig || 'none'})`);
+      this._restarts = (this._restarts || 0) + 1;
+      if (this._restarts <= 20) {
+        const delay = Math.min(30000, 1000 * this._restarts);
+        Logger.warn(`Restarting sing-box in ${delay / 1000}s (attempt ${this._restarts})...`);
+        setTimeout(() => { if (!this._stopping) this._spawn(); }, delay);
+      } else {
+        Logger.error('sing-box keeps crashing; giving up. Check sing-box.log in the data directory.');
       }
     });
+  }
 
-    return true;
+  _probeInbounds(configData) {
+    const list = (configData.inbounds || []).filter(ib => ib.listen_port && ib.listen === '127.0.0.1');
+    setTimeout(() => {
+      for (const ib of list) {
+        const sock = net.connect(ib.listen_port, '127.0.0.1');
+        sock.setTimeout(3000);
+        sock.once('connect', () => { Logger.success(`sing-box inbound ${ib.tag} listening on 127.0.0.1:${ib.listen_port}`); sock.destroy(); });
+        sock.once('error', (e) => { Logger.error(`sing-box inbound ${ib.tag} NOT listening on :${ib.listen_port} (${e.message})`); });
+        sock.once('timeout', () => { Logger.error(`sing-box inbound ${ib.tag} probe timeout on :${ib.listen_port}`); sock.destroy(); });
+      }
+    }, 2500);
   }
 
   stop() {
+    this._stopping = true;
     if (this.process && !this.process.killed) {
       try {
         this.process.kill('SIGTERM');
@@ -1938,7 +1982,18 @@ class LinkGenerator {
     this.config = config;
     this.state = state;
     this.host = config.forceHost || resolvedHost || config.domain || '127.0.0.1';
-    this.port = parseInt(process.env.LINK_PORT || '', 10) || (process.env.RAILWAY_PUBLIC_DOMAIN ? 443 : config.publicPort);
+    // BK_FIX2_APPLIED
+    const bkOnRailway = !!(process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_PROJECT_ID || process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_SERVICE_ID);
+    this.port = parseInt(process.env.LINK_PORT || '', 10) || (bkOnRailway ? 443 : config.publicPort);
+    // Railway's edge only accepts HTTPS on 443 and forwards plain HTTP to $PORT, so on Railway every
+    // WS/HTTPUpgrade link is TLS (edge-side) and plain "security=none" links are not generated.
+    // LINK_TLS=true|false overrides the detection.
+    this.edgeTls = process.env.LINK_TLS !== undefined
+      ? (process.env.LINK_TLS === 'true' || process.env.LINK_TLS === '1')
+      : (bkOnRailway && this.port === 443);
+    // Railway's edge serves a valid public certificate: never ask clients to skip verification there
+    // (Xray-core >= 26.x removed allowInsecure; links carrying it can fail to load in new clients).
+    this.insecure = !this.edgeTls;
     this.prefix = config.nodePrefix || 'BK-';
     this.wsPath = '/@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--ws';
     this.vmessPath = '/@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--vmess';
@@ -1954,6 +2009,7 @@ class LinkGenerator {
 
   generateVlessWs() {
     if (!this.config.enable.vlessWs) return null;
+    if (this.edgeTls) return null; // covered by VLESS-WS-TLS (same inbound)
     const name = '💞t.me/BlueKnight_Net - WS';
     const clashProxy = {
       name,
@@ -2005,7 +2061,8 @@ class LinkGenerator {
       network: 'ws',
       tls: true,
       servername: sni,
-      'skip-cert-verify': true,
+      'skip-cert-verify': this.insecure,
+      'client-fingerprint': 'chrome',
       'ws-opts': {
         path: this.wsPath,
         headers: { Host: sni }
@@ -2020,7 +2077,8 @@ class LinkGenerator {
       tls: {
         enabled: true,
         server_name: sni,
-        insecure: true
+        insecure: this.insecure,
+        alpn: ['http/1.1']
       },
       transport: {
         type: 'ws',
@@ -2033,7 +2091,7 @@ class LinkGenerator {
       type: 'VLESS-WS-TLS',
       label: 'CDN Cloudflare Compatible',
       compat: true,
-      uri: `vless://${this.state.uuid}@${this.host}:${this.port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=${urlSafeEncode(this.wsPath)}&fp=chrome&allowInsecure=1#${urlSafeEncode(name)}`,
+      uri: `vless://${this.state.uuid}@${this.host}:${this.port}?encryption=none&security=tls&sni=${sni}&type=ws&host=${sni}&path=${urlSafeEncode(this.wsPath)}&fp=chrome&alpn=http%2F1.1${this.insecure ? '&allowInsecure=1' : ''}#${urlSafeEncode(name)}`,
       clash: clashProxy,
       singboxOutbound: [sbOutbound],
       singboxJson: JSON.stringify([sbOutbound], null, 2)
@@ -2073,7 +2131,8 @@ class LinkGenerator {
       network: 'ws',
       tls: true,
       servername: sni,
-      'skip-cert-verify': true,
+      'skip-cert-verify': this.insecure,
+      'client-fingerprint': 'chrome',
       'ws-opts': {
         path: this.vmessPath,
         headers: { Host: sni }
@@ -2090,7 +2149,8 @@ class LinkGenerator {
       tls: {
         enabled: true,
         server_name: sni,
-        insecure: true
+        insecure: this.insecure,
+        alpn: ['http/1.1']
       },
       transport: {
         type: 'ws',
@@ -2112,6 +2172,7 @@ class LinkGenerator {
 
   generateVmessWs() {
     if (!this.config.enable.vmessWs) return null;
+    if (this.edgeTls) return null; // covered by VMess-WS-TLS (same inbound)
     const name = '💞t.me/BlueKnight_Net - VMess-WS';
     const vmessConfig = {
       v: '2',
@@ -2171,6 +2232,28 @@ class LinkGenerator {
 
   generateVlessHttpUpgrade() {
     if (!this.config.enable.vlessHttpUpgrade) return null;
+    if (this.edgeTls) {
+      const name = '💞t.me/BlueKnight_Net - HTTPUpgrade-TLS';
+      const sni = this.config.domain || this.host;
+      const sbOutbound = {
+        type: 'vless', tag: name, server: this.host, server_port: this.port, uuid: this.state.uuid,
+        tls: { enabled: true, server_name: sni, insecure: false, alpn: ['http/1.1'] },
+        transport: { type: 'httpupgrade', path: this.huPath, host: sni }
+      };
+      return {
+        name,
+        type: 'VLESS-HTTPUpgrade-TLS',
+        compat: false,
+        uri: `vless://${this.state.uuid}@${this.host}:${this.port}?encryption=none&security=tls&sni=${sni}&type=httpupgrade&host=${sni}&path=${urlSafeEncode(this.huPath)}&fp=chrome&alpn=http%2F1.1#${urlSafeEncode(name)}`,
+        clash: {
+          name, type: 'vless', server: this.host, port: this.port, uuid: this.state.uuid,
+          network: 'httpupgrade', tls: true, servername: sni, 'skip-cert-verify': false, 'client-fingerprint': 'chrome',
+          'httpupgrade-opts': { path: this.huPath, host: sni }
+        },
+        singboxOutbound: [sbOutbound],
+        singboxJson: JSON.stringify([sbOutbound], null, 2)
+      };
+    }
     const name = '💞t.me/BlueKnight_Net - HTTPUpgrade';
     const clashProxy = {
       name,
@@ -2577,6 +2660,29 @@ class LinkGenerator {
 
   generateTrojanWs() {
     if (!this.config.enable.trojanWs) return null;
+    if (this.edgeTls) {
+      const name = '💞t.me/BlueKnight_Net - Trojan-WS-TLS';
+      const sni = this.config.domain || this.host;
+      const sbOutbound = {
+        type: 'trojan', tag: name, server: this.host, server_port: this.port, password: this.state.uuid,
+        tls: { enabled: true, server_name: sni, insecure: false, alpn: ['http/1.1'] },
+        transport: { type: 'ws', path: this.trPath, headers: { Host: sni } }
+      };
+      return {
+        name,
+        type: 'Trojan-WS-TLS',
+        label: 'Trojan WebSocket TLS',
+        compat: true,
+        uri: `trojan://${this.state.uuid}@${this.host}:${this.port}?security=tls&sni=${sni}&type=ws&host=${sni}&path=${urlSafeEncode(this.trPath)}&fp=chrome&alpn=http%2F1.1#${urlSafeEncode(name)}`,
+        clash: {
+          name, type: 'trojan', server: this.host, port: this.port, password: this.state.uuid,
+          network: 'ws', tls: true, sni, 'skip-cert-verify': false, 'client-fingerprint': 'chrome',
+          'ws-opts': { path: this.trPath, headers: { Host: sni } }
+        },
+        singboxOutbound: [sbOutbound],
+        singboxJson: JSON.stringify([sbOutbound], null, 2)
+      };
+    }
     const name = '💞t.me/BlueKnight_Net - Trojan-WS';
     const trPath = this.trPath;
     const clashProxy = {
@@ -2948,30 +3054,96 @@ function createHttpPanel(config, stateManager, engineStatusGetter, resolvedHostG
   const bkPage = (mode, msg) => {
     const setup = mode === 'setup';
     const needKey = setup && !!process.env.SETUP_KEY;
-    const title = setup ? 'ساخت رمز پنل' : 'ورود به پنل';
-    const sub = setup ? 'اولین ورود: یه رمز برای پنل بساز (حداقل ۸ کاراکتر).<br><span class="en">First visit: create a panel password (min 8 characters).</span>'
-                      : 'رمز پنل رو وارد کن.<br><span class="en">Enter your panel password.</span>';
-    return '<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
-      '<title>Blue Knight Gate</title><style>' +
-      '*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#070b17 radial-gradient(circle at 30% 20%,#12306b 0,#070b17 60%);font-family:Tahoma,Segoe UI,sans-serif;color:#e2e8f0}' +
-      '.card{width:92%;max-width:380px;background:rgba(15,23,42,.85);border:1px solid #1e3a8a;border-radius:18px;padding:28px;box-shadow:0 0 40px rgba(56,189,248,.15)}' +
-      'img{width:64px;height:64px;border-radius:14px;display:block;margin:0 auto 10px}h1{font-size:20px;text-align:center;margin:6px 0 4px;color:#38bdf8}' +
-      'p{font-size:13px;text-align:center;color:#94a3b8;line-height:1.8;margin:0 0 18px}.en{direction:ltr;display:inline-block}' +
-      'label{font-size:13px;display:block;margin:12px 0 6px}input{width:100%;padding:11px 12px;border-radius:10px;border:1px solid #334155;background:#0b1224;color:#e2e8f0;font-size:15px;direction:ltr}' +
-      'button{width:100%;margin-top:18px;padding:12px;border:0;border-radius:10px;background:linear-gradient(90deg,#2563eb,#38bdf8);color:#fff;font-size:15px;font-weight:bold;cursor:pointer}' +
-      '.err{background:#450a0a;border:1px solid #991b1b;color:#fecaca;padding:9px 12px;border-radius:10px;font-size:13px;margin-bottom:6px;text-align:center}' +
-      '.foot{text-align:center;font-size:12px;color:#64748b;margin-top:16px}.foot a{color:#38bdf8;text-decoration:none}' +
-      '</style></head><body><form class="card" method="post" action="/' + panelPath + '/login">' +
-      '<img src="/knight-assets/logo.png" alt="" onerror="this.style.display=\'none\'">' +
-      '<h1>' + title + '</h1><p>' + sub + '</p>' +
-      (msg ? '<div class="err">' + bkEsc(msg) + '</div>' : '') +
-      (needKey ? '<label>Setup Key</label><input name="setup_key" type="password" autocomplete="off" required>' : '') +
-      '<label>' + (setup ? 'رمز جدید / New password' : 'رمز / Password') + '</label>' +
-      '<input name="password" type="password" minlength="' + (setup ? 8 : 1) + '" autocomplete="' + (setup ? 'new-password' : 'current-password') + '" required autofocus>' +
-      (setup ? '<label>تکرار رمز / Confirm password</label><input name="confirm" type="password" minlength="8" autocomplete="new-password" required>' : '') +
-      '<button type="submit">' + (setup ? 'ساخت رمز و ورود / Create &amp; enter' : 'ورود / Login') + '</button>' +
-      '<div class="foot">Blue Knight Gate &bull; <a href="https://t.me/BlueKnight_Net" target="_blank" rel="noopener">@BlueKnight_Net</a></div>' +
-      '</form></body></html>';
+    const A = '/knight-assets';
+    const ico = {
+      lock: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V11a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5zm-3 8V6a3 3 0 1 1 6 0v3H9zm3 4a2 2 0 0 1 1 3.73V19h-2v-2.27A2 2 0 0 1 12 13z"/></svg>',
+      key: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M14 2a8 8 0 0 0-7.75 10.02L1 17.27V23h5.73l1-1v-2h2v-2h2l1.23-1.23A8 8 0 1 0 14 2zm2.5 7.5a2 2 0 1 1 0-4 2 2 0 0 1 0 4z"/></svg>',
+      shield: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 1 3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4zm-1.2 15.2-3.5-3.5 1.4-1.4 2.1 2.1 5.3-5.3 1.4 1.4-6.7 6.7z"/></svg>',
+      eye: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 5C6.5 5 2.1 8.4 1 12c1.1 3.6 5.5 7 11 7s9.9-3.4 11-7c-1.1-3.6-5.5-7-11-7zm0 11.5a4.5 4.5 0 1 1 0-9 4.5 4.5 0 0 1 0 9zm0-2.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4z"/></svg>',
+      warn: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M1 21h22L12 2 1 21zm12-3h-2v-2h2v2zm0-4h-2v-4h2v4z"/></svg>',
+      tg: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M9.78 18.65l.28-4.23 7.68-6.92c.34-.31-.07-.46-.52-.19L7.74 13.3 3.64 12c-.88-.25-.89-.86.2-1.3l15.97-6.16c.73-.33 1.43.18 1.15 1.3l-2.72 12.81c-.19.91-.74 1.13-1.5.71L12.6 16.3l-1.99 1.93c-.23.23-.42.42-.83.42z"/></svg>',
+      arrow: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z"/></svg>'
+    };
+    const field = (name, fa, en, type, attrs, icon, toggle) =>
+      '<div class="bk-field"><label for="bk-' + name + '"><span class="fa">' + fa + '</span><span class="en">' + en + '</span></label>' +
+      '<div class="bk-input"><span class="bk-input-ico">' + icon + '</span>' +
+      '<input id="bk-' + name + '" name="' + name + '" type="' + type + '" ' + attrs + ' dir="ltr" spellcheck="false">' +
+      (toggle ? '<button type="button" class="bk-eye" data-for="bk-' + name + '" aria-label="Show / hide">' + ico.eye + '</button>' : '') +
+      '</div></div>';
+    const badge = setup ? 'FIRST-TIME SETUP' : 'SECURE ACCESS';
+    const titleEn = setup ? 'Forge Your <span class="red-text">Password</span>' : 'Enter the <span class="red-text">Gate</span>';
+    const titleFa = setup ? 'ساخت رمز پنل' : 'ورود به پنل';
+    const sub = setup
+      ? '<span class="fa">اولین ورود: یه رمز برای پنل بساز (حداقل ۸ کاراکتر).</span><span class="en">First visit: create a panel password (min 8 characters).</span>'
+      : '<span class="fa">رمز پنل رو وارد کن.</span><span class="en">Enter your panel password to continue.</span>';
+    const css =
+      ':root{--bk-glow-rgb:229,9,20}body.theme-cozy{--bk-glow-rgb:217,119,6}' +
+      'body.bk-auth-body{min-height:100vh;background-color:var(--bg-color,#0b0e17);background-image:url(' + A + '/bg.jpg);background-size:cover;background-position:center top;background-attachment:fixed;color:var(--text-white,#fff);font-family:var(--font-family,-apple-system,"Segoe UI",Roboto,Arial,sans-serif)}' +
+      '.bk-auth{position:relative;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:22px;padding:36px 16px}' +
+      '.bk-brand{display:flex;align-items:center;gap:12px;color:inherit;text-decoration:none}.bk-brand .brand-icon-box{width:42px;height:42px}.bk-brand .brand-icon-box img{width:30px;height:30px;border-radius:8px;display:block}' +
+      '.bk-card{position:relative;width:100%;max-width:440px;padding:34px 30px 26px;background:var(--card-bg,rgba(16,21,33,.82));border:1px solid var(--card-border,rgba(255,255,255,.08));border-radius:var(--radius-xl,20px);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);box-shadow:0 24px 70px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.04);overflow:hidden;animation:bkIn .5s ease both}' +
+      '.bk-card:before{content:"";position:absolute;inset:0;border-radius:inherit;padding:1px;background:linear-gradient(145deg,rgba(var(--bk-glow-rgb),.7),rgba(var(--bk-glow-rgb),0) 38%,rgba(56,189,248,0) 62%,rgba(56,189,248,.4));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}' +
+      '.bk-card-glow{position:absolute;top:-140px;left:50%;transform:translateX(-50%);width:360px;height:240px;background:radial-gradient(circle,rgba(var(--bk-glow-rgb),.32),transparent 70%);filter:blur(30px);pointer-events:none}' +
+      '.bk-crest{position:relative;width:84px;height:84px;margin:0 auto 16px;border-radius:22px;display:flex;align-items:center;justify-content:center;background:rgba(var(--bk-glow-rgb),.14);border:1px solid rgba(var(--bk-glow-rgb),.45);box-shadow:0 0 34px rgba(var(--bk-glow-rgb),.45),inset 0 0 18px rgba(var(--bk-glow-rgb),.18);animation:bkPulse 3.2s ease-in-out infinite}' +
+      '.bk-crest img{width:60px;height:60px;border-radius:14px;display:block}' +
+      '.bk-head{position:relative;text-align:center}.bk-head .hero-tag{display:inline-flex;align-self:center;gap:6px;align-items:center}.bk-head .hero-tag svg{width:13px;height:13px}' +
+      '.bk-title{font-size:1.75rem;font-weight:800;letter-spacing:-.02em;line-height:1.2;margin:14px 0 4px}' +
+      '.bk-title-fa{direction:rtl;font-size:1rem;font-weight:700;color:var(--text-gray,#9ca3af);font-family:Tahoma,var(--font-family,sans-serif)}' +
+      '.bk-sub{margin:10px 0 22px;font-size:.86rem;line-height:1.75;color:var(--text-muted,#6b7280)}.bk-sub .fa,.bk-sub .en{display:block}.bk-sub .fa{direction:rtl;font-family:Tahoma,var(--font-family,sans-serif);color:var(--text-gray,#9ca3af)}' +
+      '.bk-alert{position:relative;display:flex;gap:10px;align-items:flex-start;padding:11px 14px;margin:0 0 16px;border-radius:12px;background:rgba(var(--bk-glow-rgb),.12);border:1px solid rgba(var(--bk-glow-rgb),.45);color:#fecaca;font-size:.84rem;line-height:1.6;box-shadow:0 0 22px rgba(var(--bk-glow-rgb),.18);animation:bkShake .4s ease}' +
+      'body.theme-cozy .bk-alert{color:#fde68a}.bk-alert svg{flex:0 0 18px;width:18px;height:18px;margin-top:1px;color:var(--primary-red,#E50914)}' +
+      '.bk-field{margin-bottom:15px}.bk-field label{display:flex;justify-content:space-between;align-items:baseline;gap:8px;margin-bottom:7px;font-size:.8rem;font-weight:700;color:var(--text-gray,#9ca3af);letter-spacing:.02em}' +
+      '.bk-field label .fa{direction:rtl;font-family:Tahoma,var(--font-family,sans-serif);font-weight:400;color:var(--text-muted,#6b7280);order:2}' +
+      '.bk-input{position:relative;display:flex;align-items:center}' +
+      '.bk-input input{width:100%;padding:13px 46px;font-size:.98rem;color:var(--text-white,#fff);background:rgba(6,9,18,.72);border:1px solid rgba(255,255,255,.1);border-radius:12px;outline:none;transition:border-color .2s,box-shadow .2s,background .2s;font-family:inherit}' +
+      '.bk-input input::placeholder{color:var(--text-muted,#6b7280)}.bk-input input:focus{border-color:var(--primary-red,#E50914);background:rgba(6,9,18,.85);box-shadow:0 0 0 3px rgba(var(--bk-glow-rgb),.2),0 0 22px rgba(var(--bk-glow-rgb),.35)}' +
+      '.bk-input-ico{position:absolute;left:14px;width:18px;height:18px;color:var(--text-muted,#6b7280);pointer-events:none;transition:color .2s}.bk-input:focus-within .bk-input-ico{color:var(--primary-red,#E50914)}.bk-input-ico svg,.bk-eye svg{width:18px;height:18px;display:block}' +
+      '.bk-eye{position:absolute;right:8px;padding:7px;border:0;border-radius:8px;background:transparent;color:var(--text-muted,#6b7280);cursor:pointer;transition:color .2s,background .2s}.bk-eye:hover,.bk-eye.on{color:var(--text-white,#fff);background:rgba(255,255,255,.07)}' +
+      '.bk-hint{margin:-6px 0 14px;font-size:.74rem;color:var(--text-muted,#6b7280);line-height:1.6}.bk-hint span,.bk-alert span{display:block}.bk-hint .fa,.bk-alert .fa{direction:rtl;text-align:right;font-family:Tahoma,var(--font-family,sans-serif)}.bk-alert>div{flex:1}' +
+      '.bk-submit{width:100%;justify-content:center;margin-top:8px;border:0;cursor:pointer;font-family:inherit;position:relative;overflow:hidden;box-shadow:0 6px 24px rgba(var(--bk-glow-rgb),.45)}' +
+      '.bk-submit:hover{transform:translateY(-1px);box-shadow:0 10px 34px rgba(var(--bk-glow-rgb),.6)}.bk-submit:active{transform:translateY(0)}.bk-submit svg{width:18px;height:18px}' +
+      '.bk-submit:after{content:"";position:absolute;top:0;left:-60%;width:40%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.28),transparent);transform:skewX(-20deg);animation:bkShine 3.6s ease-in-out infinite}' +
+      '.bk-submit[disabled]{opacity:.75;cursor:wait}' +
+      '.bk-secure{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:16px;font-size:.74rem;color:var(--text-muted,#6b7280)}.bk-secure svg{width:14px;height:14px;color:var(--accent-green,#22c55e)}' +
+      '.bk-foot{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}.bk-foot a{padding:8px 16px;font-size:.82rem}.bk-foot svg{width:16px;height:16px}.bk-foot .sp{font-size:.62rem;font-weight:800;letter-spacing:.08em;padding:2px 6px;border-radius:5px;background:rgba(56,189,248,.16);color:#7dd3fc}' +
+      '@keyframes bkIn{from{opacity:0;transform:translateY(14px) scale(.98)}to{opacity:1;transform:none}}' +
+      '@keyframes bkPulse{0%,100%{box-shadow:0 0 26px rgba(var(--bk-glow-rgb),.35),inset 0 0 18px rgba(var(--bk-glow-rgb),.15)}50%{box-shadow:0 0 44px rgba(var(--bk-glow-rgb),.6),inset 0 0 22px rgba(var(--bk-glow-rgb),.25)}}' +
+      '@keyframes bkShine{0%,60%{left:-60%}100%{left:130%}}@keyframes bkShake{0%,100%{transform:none}25%{transform:translateX(-5px)}75%{transform:translateX(5px)}}' +
+      '@media (max-width:480px){.bk-card{padding:28px 20px 22px}.bk-title{font-size:1.45rem}}' +
+      '@media (prefers-reduced-motion:reduce){.bk-card,.bk-crest,.bk-alert,.bk-submit:after{animation:none}}';
+    const js =
+      'try{var t=localStorage.getItem("bk-theme")||localStorage.getItem("bk_gate_theme");if(t==="cozy"){document.documentElement.setAttribute("data-theme","cozy");document.body.setAttribute("data-theme","cozy");document.body.classList.add("theme-cozy");document.body.style.backgroundImage="url(' + A + '/cozybg.jpg)";}}catch(e){}' +
+      'document.querySelectorAll(".bk-eye").forEach(function(b){b.addEventListener("click",function(){var i=document.getElementById(b.getAttribute("data-for"));if(!i)return;var s=i.type==="password";i.type=s?"text":"password";b.classList.toggle("on",s);i.focus();});});' +
+      'var f=document.getElementById("bk-form");if(f)f.addEventListener("submit",function(){var b=f.querySelector(".bk-submit");if(b){setTimeout(function(){b.disabled=true;},0);}});';
+    return '<!doctype html><html lang="fa" data-theme="dark"><head><meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=5">' +
+      '<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#0b0e17">' +
+      '<title>' + (setup ? 'Create Password' : 'Login') + ' | Blue Knight Gate</title>' +
+      '<link rel="icon" type="image/png" href="' + A + '/logo.png">' +
+      '<link rel="stylesheet" href="' + A + '/app.css"><style>' + css + '</style></head>' +
+      '<body class="bk-auth-body" data-theme="dark">' +
+      '<div class="cinema-bg"><div class="ambient-glow"></div><div class="ambient-vignette"></div></div>' +
+      '<main class="bk-auth">' +
+      '<a class="bk-brand" href="/' + panelPath + '/login"><div class="brand-icon-box"><img src="' + A + '/logo.png" alt="" onerror="this.style.display=\'none\'"></div>' +
+      '<div class="brand-info"><div class="brand-title"><span class="white-text">Blue Knight</span> <span class="red-text">Gate</span></div><div class="brand-tagline">Stream Without Limits</div></div></a>' +
+      '<form id="bk-form" class="bk-card" method="post" action="/' + panelPath + '/login" autocomplete="on">' +
+      '<div class="bk-card-glow"></div>' +
+      '<div class="bk-head"><div class="bk-crest"><img src="' + A + '/logo.png" alt="Blue Knight" onerror="this.style.display=\'none\'"></div>' +
+      '<div class="hero-tag">' + (setup ? ico.key : ico.shield) + badge + '</div>' +
+      '<h1 class="bk-title">' + titleEn + '</h1><div class="bk-title-fa">' + titleFa + '</div>' +
+      '<p class="bk-sub">' + sub + '</p></div>' +
+      (msg ? '<div class="bk-alert" role="alert">' + ico.warn + '<div>' + String(msg).split(' / ').map((t, i) => '<span class="' + (i === 0 && /[\u0600-\u06FF]/.test(t) ? 'fa' : 'en') + '">' + bkEsc(t) + '</span>').join('') + '</div></div>' : '') +
+      (needKey ? field('setup_key', 'کلید راه‌اندازی', 'SETUP KEY', 'password', 'autocomplete="off" required placeholder="SETUP_KEY"', ico.key, true) +
+        '<div class="bk-hint"><span class="fa">مقدار متغیر SETUP_KEY که توی Railway گذاشتی.</span><span class="en">The SETUP_KEY value from your Railway variables.</span></div>' : '') +
+      field('password', setup ? 'رمز جدید' : 'رمز', setup ? 'NEW PASSWORD' : 'PASSWORD', 'password',
+        'minlength="' + (setup ? 8 : 1) + '" autocomplete="' + (setup ? 'new-password' : 'current-password') + '" required autofocus placeholder="' + (setup ? 'At least 8 characters' : 'Your panel password') + '"', ico.lock, true) +
+      (setup ? field('confirm', 'تکرار رمز', 'CONFIRM PASSWORD', 'password', 'minlength="8" autocomplete="new-password" required placeholder="Repeat password"', ico.lock, true) : '') +
+      '<button type="submit" class="btn-primary-red bk-submit">' + (setup ? ico.key : ico.arrow) + '<span>' + (setup ? 'ساخت رمز و ورود &nbsp;/&nbsp; Create &amp; Enter' : 'ورود &nbsp;/&nbsp; Login') + '</span></button>' +
+      '<div class="bk-secure">' + ico.shield + '<span>' + (setup ? 'Stored as a salted scrypt hash on your volume' : 'Encrypted session &bull; 30 days') + '</span></div>' +
+      '</form>' +
+      '<div class="bk-foot"><a class="btn-secondary-dark" href="https://t.me/BlueKnight_Net" target="_blank" rel="noopener">' + ico.tg + 'Telegram</a>' +
+      '<a class="btn-secondary-dark" href="https://t.me/whitedns" target="_blank" rel="noopener"><span class="sp">SPONSOR</span>WhiteDNS</a></div>' +
+      '</main><script>' + js + '</script></body></html>';
   };
   const bkSendPage = (res, mode, msg, code) => {
     res.status(code || 200);
@@ -3422,7 +3594,8 @@ class TcpRouter {
       socket.setKeepAlive(true, 10000);
       socket.setNoDelay(true);
 
-      const url = req.url || '';
+      let url = req.url || '';
+      try { url = decodeURIComponent(url.split('?')[0]); } catch (_) { url = url.split('?')[0]; }
       const brandedWs = '/@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--ws';
       const brandedVmess = '/@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--vmess';
       const brandedHu = '/@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--@BlueKnight_Net--httpupgrade';
@@ -3455,6 +3628,11 @@ class TcpRouter {
         label = 'Trojan-WS';
       }
 
+      this._upgradeCount = (this._upgradeCount || 0) + 1;
+      if (this._upgradeCount <= 20 || !destPort) {
+        Logger.info(`WS upgrade #${this._upgradeCount} ${label} path=${url.slice(0, 80)} host=${req.headers.host || '-'}${destPort ? ' -> :' + destPort : ' -> 404 (no route)'}`);
+      }
+
       if (!destPort) {
         socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
         socket.destroy();
@@ -3481,13 +3659,25 @@ class TcpRouter {
         backend.pipe(socket);
       });
 
-      backend.on('error', () => {
+      let bkConnected = false;
+      backend.once('connect', () => { bkConnected = true; });
+      backend.on('error', (err) => {
+        if (!bkConnected) {
+          const now = Date.now();
+          if (!this._lastUpErr || now - this._lastUpErr > 15000) {
+            this._lastUpErr = now;
+            Logger.error(`${label} backend :${destPort} unreachable (${err.message}) - is sing-box running? See sing-box.log`);
+          }
+          try { socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n'); } catch {}
+        }
         try { socket.destroy(); } catch {}
       });
 
       socket.on('error', () => {
         try { backend.destroy(); } catch {}
       });
+      socket.on('close', () => { try { backend.destroy(); } catch {} });
+      backend.on('close', () => { try { socket.destroy(); } catch {} });
     });
   }
 
