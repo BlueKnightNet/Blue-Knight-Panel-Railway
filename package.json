@@ -1,0 +1,18 @@
+{
+  "name": "blue-knight-gate",
+  "version": "1.0.0",
+  "description": "Blue Knight Gate - multi-protocol proxy and web panel (Railway edition)",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "express": "^4.21.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "author": "Blue Knight Net",
+  "license": "MIT"
+}
